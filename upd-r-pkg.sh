@@ -2,7 +2,7 @@
 
 SELF="$0"
 BASE_DIR="$(pwd)"
-BUILD_DB="$BASE_DIR/r-packages_db"
+BUILD_DB="$BASE_DIR/r-packages.db"
 BUILD_DIR="$BASE_DIR/packages"
 REPO_DIR="$BASE_DIR/repo"
 REPO_DB="$REPO_DIR/r-packages.db.tar.zst"
@@ -35,6 +35,11 @@ get_packages () {
 		sqlite3 "$BUILD_DB"
 }
 
+get_distinct_packages () {
+	sqlite3 -list "$BUILD_DB" \
+		"SELECT DISTINCT name FROM packages;" 2> /dev/null
+}
+
 print_PKGBUILD () {
 	local package="${1:?Must specify a package}"
 	local version="${2:?Must provide the package version string}"
@@ -52,7 +57,48 @@ print_PKGBUILD () {
 # DB Operations #
 #################
 
+full_update_db () {
+	# Clear out all past data
+	sqlite3 -list "$BUILD_DB" \
+		"DELETE FROM packages; \
+		DELETE FROM r_depends; \
+		DELETE FROM package_info;"
+
+	# Insert current packages
+	while read -r pkg; do
+		sqlite3 -list "$BUILD_DB" \
+			"INSERT INTO package_info (Package) \
+			VALUES ('$pkg')"
+	done < "$DEPLOY_LIST"
+
+	# Pull information of new packages
+	sqlite3 -list "$BUILD_DB" \
+		"SELECT * \
+		FROM packages;" 2> /dev/null |
+		Rscript <(get_script get-updates.R) |
+		sqlite3 "$BUILD_DB"
+
+	# Get dependencies
+	while read -r pkg; do
+		while read -r dep ver; do
+			echo "INSERT INTO r_depends \
+				(parent_name, depend_name, min_version) \
+				VALUES ('$pkg', '$dep', '$ver');"
+		done < <(sqlite3 -list "$BUILD_DB" \
+				"SELECT Imports \
+				FROM package_info \
+				WHERE Package = '$pkg';" 2> /dev/null |
+				tr -d " >=)" |
+				tr "," "\n")
+	done < "$DEPLOY_LIST" |
+		sqlite3 -list "$BUILD_DB" 2> /dev/null
+}
+
 initialize_db () {
+	# Make initial directories
+	mkdir -p "$REPO_DIR" "$BUILD_DIR"
+
+	# Set up database
 	sqlite3 -list "$BUILD_DB" \
 		"CREATE TABLE IF NOT EXISTS packages \
 		(name TEXT, \
@@ -69,6 +115,7 @@ initialize_db () {
 		Version TEXT, \
 		Title TEXT, \
 		License TEXT, \
+		Depends TEXT, \
 		Imports TEXT, \
 		Suggests TEXT, \
 		MD5sum TEXT, \
@@ -94,7 +141,7 @@ initialize_db () {
 			VALUES ('$pkg', '$ver');" 2> /dev/null
 	done < <(sqlite3 -list "$BUILD_DB" \
 			"SELECT Package, Version \
-			FROM package_info WHERE Package = $pkg;")
+			FROM package_info;")
 
 	# Update dependencies
 	while IFS= read -r pkg; do
@@ -291,7 +338,8 @@ deploy () {
 	message="Updated r-$package to version $version"
 	if ! git add "$BUILD_DIR/$package.PKGBUILD" &&
 			git commit -m "$message" &&
-			git push --all; then
+			# git push --all; then
+			true; then
 		# Abort if we can't commit the changes
 		printf "Failed to deploy %s-%s\n" "$package" "$version"
 		git reset -q --hard HEAD
